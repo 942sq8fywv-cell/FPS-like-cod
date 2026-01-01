@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport"
+        content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+  <title>Mobile Scratch FPS Waves</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+    canvas { width:100vw; height:100vh; display:block; background:#000; touch-action:none; }
+
+    /* HUD */
+    #hud{
+      position:fixed; left:12px; top:12px; z-index:6;
+      color:#fff; font:14px/1.2 system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      text-shadow:0 2px 10px rgba(0,0,0,.9);
+      pointer-events:none; user-select:none;
+    }
+    #cross{
+      position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+      width:18px; height:18px; z-index:6; pointer-events:none;
+    }
+    #cross:before,#cross:after{
+      content:""; position:absolute; left:50%; top:50%;
+      transform:translate(-50%,-50%);
+      background:rgba(255,255,255,.92);
+    }
+    #cross:before{ width:2px; height:18px; }
+    #cross:after{ width:18px; height:2px; }
+
+    /* UI overlay */
+    #ui { position:fixed; inset:0; z-index:10; pointer-events:none; }
+
+    /* Left joystick */
+    #pad {
+      position:absolute; left:18px; bottom:18px;
+      width:150px; height:150px; border-radius:50%;
+      background:rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.16);
+      pointer-events:auto; touch-action:none;
+    }
+    #stick {
+      position:absolute; left:50%; top:50%;
+      width:68px; height:68px; border-radius:50%;
+      transform:translate(-50%,-50%);
+      background:rgba(255,255,255,.12);
+      border:1px solid rgba(255,255,255,.25);
+    }
+
+    /* Buttons */
+    .btn{
+      position:absolute; right:18px;
+      width:150px; height:66px; border-radius:16px;
+      background:rgba(255,255,255,.10);
+      border:1px solid rgba(255,255,255,.22);
+      color:#fff; display:flex; align-items:center; justify-content:center;
+      font:800 16px system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      pointer-events:auto; touch-action:none;
+      -webkit-tap-highlight-color: transparent;
+      user-select:none;
+    }
+    #shoot { bottom:18px; }
+    #reload { bottom:96px; font-weight:750; opacity:.95; }
+
+    /* Right look zone (invisible) */
+    #lookZone{
+      position:absolute; right:0; top:0; bottom:0;
+      width:52vw; pointer-events:auto; touch-action:none;
+    }
+
+    /* Tiny hint (not a menu) */
+    #hint{
+      position:fixed; left:50%; top:10px; transform:translateX(-50%);
+      z-index:20; color:rgba(255,255,255,.85);
+      font:12px system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      background:rgba(0,0,0,.35);
+      border:1px solid rgba(255,255,255,.14);
+      padding:8px 10px; border-radius:12px;
+      text-shadow:0 2px 10px rgba(0,0,0,.9);
+      user-select:none; pointer-events:none;
+    }
+    .safe { padding-bottom: env(safe-area-inset-bottom); padding-top: env(safe-area-inset-top); }
+  </style>
+</head>
+<body class="safe">
+  <canvas id="c"></canvas>
+
+  <div id="hud"></div>
+  <div id="cross"></div>
+
+  <div id="ui">
+    <div id="pad"><div id="stick"></div></div>
+    <div id="lookZone"></div>
+    <div id="reload" class="btn">RELOAD</div>
+    <div id="shoot" class="btn">SHOOT</div>
+  </div>
+
+  <div id="hint">Touch screen to enable sound/haptics • Left = move • Right drag = look</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha:false });
+  const hud = document.getElementById("hud");
+  const hint = document.getElementById("hint");
+
+  // --- internal render resolution (keeps it fast on mobile) ---
+  function resize() {
+    const scale = Math.max(1.25, Math.min(2.0, devicePixelRatio ? (1.6 / devicePixelRatio) : 1.6));
+    canvas.width  = Math.floor(innerWidth / scale);
+    canvas.height = Math.floor(innerHeight / scale);
+  }
+  addEventListener("resize", resize, { passive:true });
+  resize();
+
+  // --- Simple map (1 walls, 0 empty) ---
+  const mapW = 24, mapH = 24;
+  const map = [
+    "111111111111111111111111",
+    "100000000000000000000001",
+    "101111011111011111011101",
+    "100001000001000001000001",
+    "101101111101111101111101",
+    "100100000100000100000001",
+    "101111110111011111011101",
+    "100000010000010000010001",
+    "111110011111011111010111",
+    "100010000000000000010001",
+    "101011111011111011110101",
+    "100000001000001000000001",
+    "101111101111101111101101",
+    "100000100000100000100001",
+    "101110111011111011101101",
+    "100010000010000000010001",
+    "101011111110111111110101",
+    "100000000000000000000001",
+    "101111111011111011111101",
+    "100000001000001000000001",
+    "101111101111101111101101",
+    "100000100000100000100001",
+    "100000000000000000000001",
+    "111111111111111111111111",
+  ].map(r => r.split("").map(ch => ch === "1" ? 1 : 0));
+
+  // --- Helpers ---
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const dist = (ax,ay,bx,by)=>Math.hypot(ax-bx, ay-by);
+
+  // --- Player ---
+  const player = {
+    x: 12.0, y: 12.0,
+    a: 0,
+    fov: Math.PI/3,
+    hp: 100,
+    baseSpeed: 3.0,
+    // pistol
+    magSize: 12,
+    ammoInMag: 12,
+    reserve: 72,
+    reloading: false,
+    reloadTime: 0.95,
+    fireDelay: 0.16,
+    lastShot: -999,
+    damage: 34,
+    spread: 0.014
+  };
+
+  // --- Enemies / waves ---
+  const enemies = [];
+  let wave = 0;
+  let alive = 0;
+  let waveCooldown = 0;
+
+  function spawnWave() {
+    wave++;
+    const count = 4 + Math.floor(wave * 1.35);
+    alive = count;
+    for (let i=0;i<count;i++){
+      let ex, ey, tries=0;
+      do{
+        tries++;
+        const side = (Math.random()*4)|0;
+        if (side===0){ ex=1+Math.random()*(mapW-2); ey=1.5; }
+        if (side===1){ ex=mapW-2.5; ey=1+Math.random()*(mapH-2); }
+        if (side===2){ ex=1+Math.random()*(mapW-2); ey=mapH-2.5; }
+        if (side===3){ ex=1.5; ey=1+Math.random()*(mapH-2); }
+      } while ((map[ey|0][ex|0]===1 || dist(ex,ey,player.x,player.y)<6) && tries<300);
+
+      enemies.push({
+        x: ex, y: ey,
+        hp: 60 + wave*8,
+        speed: 1.15 + Math.min(1.8, wave*0.06),
+        hitCooldown: 0
+      });
+    }
+  }
+
+  // --- Collision ---
+  function isWall(x,y){
+    const mx = x|0, my = y|0;
+    if (mx<0||my<0||mx>=mapW||my>=mapH) return true;
+    return map[my][mx]===1;
+  }
+
+  // --- Raycast (for walls + basic LOS checks) ---
+  function castRay(angle, maxDist=30){
+    const dx = Math.cos(angle), dy = Math.sin(angle);
+    for (let t=0;t<maxDist;t+=0.02){
+      const x = player.x + dx*t;
+      const y = player.y + dy*t;
+      const mx = x|0, my = y|0;
+      if (mx<0||my<0||mx>=mapW||my>=mapH) return { hit:true, dist:t };
+      if (map[my][mx]===1) return { hit:true, dist:t };
+    }
+    return { hit:false, dist:maxDist };
+  }
+
+  // --- Shooting (hitscan) ---
+  function shoot(){
+    const now = performance.now()/1000;
+    if (player.hp<=0) return;
+    if (player.reloading) return;
+    if (now - player.lastShot < player.fireDelay) return;
+    if (player.ammoInMag<=0) return;
+
+    player.lastShot = now;
+    player.ammoInMag--;
+
+    const ang = player.a + (Math.random()*2-1)*player.spread;
+
+    // wall stop distance
+    const wall = castRay(ang, 30);
+    const wallDist = wall.dist;
+
+    const rx = Math.cos(ang), ry = Math.sin(ang);
+
+    let best = null;
+    let bestT = 999;
+
+    for (const en of enemies){
+      if (en.hp<=0) continue;
+
+      const vx = en.x - player.x;
+      const vy = en.y - player.y;
+      const t = vx*rx + vy*ry;  // projection along ray
+      if (t<=0 || t>=wallDist) continue;
+
+      const px = player.x + rx*t;
+      const py = player.y + ry*t;
+      const perp = dist(px,py,en.x,en.y);
+
+      if (perp < 0.24 && t < bestT){
+        bestT = t;
+        best = en;
+      }
+    }
+
+    if (best){
+      best.hp -= player.damage;
+      if (best.hp<=0) alive--;
+      // tiny “hit” feel: quick screen flash (cheap + effective)
+      flash = 0.12;
+      tryHaptic();
+    }
+  }
+
+  function startReload(){
+    if (player.hp<=0) return;
+    if (player.reloading) return;
+    if (player.ammoInMag >= player.magSize) return;
+    if (player.reserve <= 0) return;
+
+    player.reloading = true;
+    const end = performance.now()/1000 + player.reloadTime;
+
+    const tick = () => {
+      if ((performance.now()/1000) >= end){
+        const need = player.magSize - player.ammoInMag;
+        const take = Math.min(need, player.reserve);
+        player.reserve -= take;
+        player.ammoInMag += take;
+        player.reloading = false;
+      } else {
+        requestAnimationFrame(tick);
+      }
+    };
+    requestAnimationFrame(tick);
+  }
+
+  // --- Touch controls ---
+  const pad = document.getElementById("pad");
+  const stick = document.getElementById("stick");
+  const lookZone = document.getElementById("lookZone");
+  const shootBtn = document.getElementById("shoot");
+  const reloadBtn = document.getElementById("reload");
+
+  let moveX = 0, moveY = 0;     // -1..1
+  let joyId = null;
+  let joyCenter = {x:0,y:0};
+
+  let lookId = null;
+  let lookLast = {x:0,y:0};
+  let lookVel = 0;             // for smoothing
+
+  // iOS requires user gesture to enable some stuff — we just hide hint on first touch
+  let engaged = false;
+  function engageOnce(){
+    if (engaged) return;
+    engaged = true;
+    hint.style.display = "none";
+    // spawn first wave immediately
+    if (wave===0) spawnWave();
+  }
+  addEventListener("touchstart", engageOnce, { passive:true });
+
+  pad.addEventListener("touchstart", (e) => {
+    engageOnce();
+    const t = e.changedTouches[0];
+    joyId = t.identifier;
+    const r = pad.getBoundingClientRect();
+    joyCenter.x = r.left + r.width/2;
+    joyCenter.y = r.top + r.height/2;
+    moveJoystick(t.clientX, t.clientY);
+    e.preventDefault();
+  }, { passive:false });
+
+  pad.addEventListener("touchmove", (e) => {
+    for (const t of e.changedTouches){
+      if (t.identifier===joyId){
+        moveJoystick(t.clientX, t.clientY);
+        break;
+      }
+    }
+    e.preventDefault();
+  }, { passive:false });
+
+  pad.addEventListener("touchend", (e) => {
+    for (const t of e.changedTouches){
+      if (t.identifier===joyId){
+        joyId = null;
+        moveX = moveY = 0;
+        stick.style.transform = "translate(-50%,-50%)";
+        break;
+      }
+    }
+    e.preventDefault();
+  }, { passive:false });
+
+  function moveJoystick(x,y){
+    const dx = x - joyCenter.x;
+    const dy = y - joyCenter.y;
+    const max = 52;
+    const len = Math.hypot(dx,dy) || 1;
+    const nx = (dx/len) * Math.min(max, len);
+    const ny = (dy/len) * Math.min(max, len);
+
+    stick.style.transform = `translate(${nx}px, ${ny}px) translate(-50%,-50%)`;
+    moveX = clamp(nx/max, -1, 1);
+    moveY = clamp(ny/max, -1, 1);
+  }
+
+  lookZone.addEventListener("touchstart", (e) => {
+    engageOnce();
+    const t = e.changedTouches[0];
+    lookId = t.identifier;
+    lookLast.x = t.clientX;
+    lookLast.y = t.clientY;
+    e.preventDefault();
+  }, { passive:false });
+
+  lookZone.addEventListener("touchmove", (e) => {
+    for (const t of e.changedTouches){
+      if (t.identifier===lookId){
+        const dx = t.clientX - lookLast.x;
+        lookLast.x = t.clientX;
+        // sensitivity tuned for phones
+        lookVel += dx * 0.0032;
+        break;
+      }
+    }
+    e.preventDefault();
+  }, { passive:false });
+
+  lookZone.addEventListener("touchend", (e) => {
+    for (const t of e.changedTouches){
+      if (t.identifier===lookId){
+        lookId = null;
+        break;
+      }
+    }
+    e.preventDefault();
+  }, { passive:false });
+
+  // Buttons
+  shootBtn.addEventListener("touchstart", (e)=>{ engageOnce(); shoot(); e.preventDefault(); }, { passive:false });
+  reloadBtn.addEventListener("touchstart", (e)=>{ engageOnce(); startReload(); e.preventDefault(); }, { passive:false });
+
+  // Optional haptic on supported mobile
+  function tryHaptic(){
+    // very light, only if available
+    if (navigator.vibrate) navigator.vibrate(10);
+  }
+
+  // --- Movement + enemies update ---
+  function movePlayer(dt){
+    const forward = -moveY;    // up on stick is negative dy
+    const strafe  = moveX;
+
+    const fx = Math.cos(player.a), fy = Math.sin(player.a);
+    const sx = Math.cos(player.a + Math.PI/2), sy = Math.sin(player.a + Math.PI/2);
+
+    let vx = fx*forward + sx*strafe;
+    let vy = fy*forward + sy*strafe;
+    const len = Math.hypot(vx,vy);
+    if (len>0){ vx/=len; vy/=len; }
+
+    const spd = player.baseSpeed;
+    const nx = player.x + vx*spd*dt;
+    const ny = player.y + vy*spd*dt;
+
+    const r = 0.18;
+    if (!isWall(nx+r, player.y) && !isWall(nx-r, player.y)) player.x = nx;
+    if (!isWall(player.x, ny+r) && !isWall(player.x, ny-r)) player.y = ny;
+  }
+
+  function updateEnemies(dt){
+    for (const en of enemies){
+      if (en.hp<=0) continue;
+
+      const dx = player.x - en.x;
+      const dy = player.y - en.y;
+      const d = Math.hypot(dx,dy) || 1;
+
+      const vx = (dx/d) * en.speed;
+      const vy = (dy/d) * en.speed;
+
+      const nx = en.x + vx*dt;
+      const ny = en.y + vy*dt;
+
+      if (!isWall(nx, en.y)) en.x = nx;
+      if (!isWall(en.x, ny)) en.y = ny;
+
+      en.hitCooldown = Math.max(0, en.hitCooldown - dt);
+      if (d < 0.70 && en.hitCooldown <= 0){
+        player.hp -= 10;
+        en.hitCooldown = 0.55;
+        flash = 0.10;
+        tryHaptic();
+      }
+    }
+  }
+
+  // --- Rendering (raycast walls + enemy billboards) ---
+  let flash = 0;
+
+  function render(){
+    const w = canvas.width, h = canvas.height;
+
+    // sky/floor
+    ctx.fillStyle = "#0a0e17";
+    ctx.fillRect(0,0,w,h/2);
+    ctx.fillStyle = "#101010";
+    ctx.fillRect(0,h/2,w,h/2);
+
+    // walls
+    const cols = w;
+    for (let x=0;x<cols;x++){
+      const camX = (2*x/cols - 1);
+      const ang = player.a + camX*(player.fov/2);
+
+      const ray = castRay(ang, 30);
+      const corrected = ray.dist * Math.cos(ang - player.a);
+      const wallH = Math.min(h, (h / Math.max(0.001, corrected)) * 0.95);
+      const y0 = (h - wallH)/2;
+
+      const shade = (clamp(255 - corrected*18, 30, 220))|0;
+      ctx.fillStyle = `rgb(${shade},${shade},${shade})`;
+      ctx.fillRect(x, y0, 1, wallH);
+    }
+
+    // enemies (billboards)
+    const living = enemies.filter(e=>e.hp>0);
+    living.sort((a,b)=>dist(b.x,b.y,player.x,player.y)-dist(a.x,a.y,player.x,player.y));
+
+    for (const en of living){
+      const dx = en.x - player.x;
+      const dy = en.y - player.y;
+
+      const angTo = Math.atan2(dy, dx);
+      let rel = angTo - player.a;
+      while (rel < -Math.PI) rel += Math.PI*2;
+      while (rel >  Math.PI) rel -= Math.PI*2;
+
+      const d = Math.hypot(dx,dy);
+
+      if (Math.abs(rel) > player.fov/2 + 0.15) continue;
+
+      // behind wall?
+      const wall = castRay(angTo, 30);
+      if (wall.dist < d) continue;
+
+      const screenX = (rel/(player.fov/2))*(w/2) + (w/2);
+      const size = clamp((h/d)*0.60, 2, h);
+
+      const x0 = screenX - size/2;
+      const y0 = (h/2) - size/2;
+
+      ctx.fillStyle = "#b61f2a";
+      ctx.fillRect(x0, y0, size, size);
+
+      ctx.fillStyle = "#f2d7b6";
+      ctx.fillRect(x0+size*0.3, y0+size*0.08, size*0.4, size*0.25);
+
+      // health bar
+      const maxHp = 60 + wave*8;
+      const hpPct = clamp(en.hp/maxHp, 0, 1);
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(x0, y0-6, size, 4);
+      ctx.fillStyle = "rgba(0,255,0,0.9)";
+      ctx.fillRect(x0, y0-6, size*hpPct, 4);
+    }
+
+    // gun block (simple viewmodel)
+    ctx.fillStyle = "rgba(0,0,0,0.52)";
+    ctx.fillRect(w*0.66, h*0.72, w*0.32, h*0.26);
+    ctx.fillStyle = "rgba(130,130,130,0.95)";
+    ctx.fillRect(w*0.72, h*0.80, w*0.20, h*0.10);
+    ctx.fillStyle = "rgba(70,70,70,0.95)";
+    ctx.fillRect(w*0.80, h*0.85, w*0.12, h*0.07);
+
+    // hit flash
+    if (flash > 0){
+      ctx.fillStyle = `rgba(255,255,255,${clamp(flash,0,0.18)})`;
+      ctx.fillRect(0,0,w,h);
+    }
+  }
+
+  function renderHUD(){
+    const status =
+      player.hp<=0 ? "DEAD — refresh to restart" :
+      (alive<=0 ? "Wave cleared…" : "Survive");
+
+    hud.innerHTML =
+      `<div style="font-weight:800;font-size:16px;">HP: ${Math.max(0,player.hp)|0} • Wave: ${wave} • Alive: ${Math.max(0,alive)|0}</div>` +
+      `<div>Ammo: ${player.ammoInMag}/${player.magSize} • Reserve: ${player.reserve}${player.reloading ? " • Reloading…" : ""}</div>` +
+      `<div style="opacity:.9">${status}</div>`;
+  }
+
+  // --- Game loop ---
+  let last = performance.now()/1000;
+
+  function loop(){
+    const now = performance.now()/1000;
+    const dt = Math.min(0.033, now - last);
+    last = now;
+
+    // smooth look
+    player.a += lookVel;
+    lookVel *= 0.80;
+    if (player.a < -Math.PI) player.a += Math.PI*2;
+    if (player.a >  Math.PI) player.a -= Math.PI*2;
+
+    if (flash > 0) flash = Math.max(0, flash - dt);
+
+    if (player.hp > 0){
+      // wave logic
+      if (wave===0 && engaged) spawnWave();
+
+      movePlayer(dt);
+      updateEnemies(dt);
+
+      if (alive <= 0 && engaged){
+        waveCooldown = Math.max(0, waveCooldown - dt);
+        if (waveCooldown === 0){
+          waveCooldown = 1.2;
+          spawnWave();
+        }
+      }
+    }
+
+    render();
+    renderHUD();
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
